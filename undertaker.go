@@ -32,7 +32,6 @@ func filterContainers(containers []docker.APIContainers, patterns []*regexp.Rege
 				}
 			}
 			if match_found {
-				break
 			}
 		}
 		if !match_found {
