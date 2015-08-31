@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	//"encoding/json"
+	"flag"
 	"fmt"
 	"github.com/fsouza/go-dockerclient"
 	"log"
@@ -12,7 +13,7 @@ import (
 	"time"
 )
 
-func filterContainers(containers []docker.APIContainers, patterns []*regexp.Regexp) []docker.APIContainers {
+func filterContainers(client *docker.Client, containers []docker.APIContainers, patterns []*regexp.Regexp,inuse_ids *[]string) []docker.APIContainers {
 	var res []docker.APIContainers
 
 	var match_found bool
@@ -25,8 +26,12 @@ func filterContainers(containers []docker.APIContainers, patterns []*regexp.Rege
 				match_found = true
 				break
 			}
+			
+			fmt.Println("names=",container.Names);
+			
 			for _, name := range container.Names {
-				if len(pattern.FindString(name)) > 0 {
+				// NOTE: the name starts with a slash (don't match against it)!
+				if len(pattern.FindString(name[1:])) > 0 {
 					match_found = true
 					break
 				}
@@ -37,6 +42,10 @@ func filterContainers(containers []docker.APIContainers, patterns []*regexp.Rege
 		}
 		if !match_found {
 			res = append(res, container)
+		} else {
+			tmp, _ := client.InspectContainer(container.ID)
+			*inuse_ids = append(*inuse_ids,tmp.Image);
+			//fmt.Printf("image excluded: %s (%s)\n",tmp.Image, container.Image);
 		}
 	}
 
@@ -48,28 +57,33 @@ func filterImages(images []docker.APIImages, patterns []*regexp.Regexp, inuseids
 
 	var match_found bool
 
+	//fmt.Println("filterImages: size=",len(images))
+
 	for _, image := range images {
 		match_found = false
 
 		// check if this image is in use
 		for _,inuse := range inuseids {
 			if image.ID == inuse {
+				//fmt.Println("filterImages: image id ",image.ID," matches ",inuse);
 				match_found = true;
 				break;
 			}
 		}
 
 		if match_found {
-			break;
+			continue;
 		}
 
 		// loop over patterns and check ID and RepoTags[] for match
 		for _, pattern := range patterns {
 			if len(pattern.FindString(image.ID)) > 0 {
+				//fmt.Println("filterImages: pattern match against ",image.ID);
 				match_found = true
 				break
 			}
 			for _, name := range image.RepoTags {
+				//fmt.Println("filterImages: pattern match against ",name);
 				if len(pattern.FindString(name)) > 0 {
 					match_found = true
 					break
@@ -134,16 +148,58 @@ func loadExcludes(filename string) ([]*regexp.Regexp, error) {
 	return res, nil
 }
 
+
+// Define a type named "intslice" as a slice of ints
+type stringslice []string
+ 
+// Now, for our new type, implement the two methods of
+// the flag.Value interface...
+// The first method is String() string
+func (i *stringslice) String() string {
+    return fmt.Sprintf("%s", *i);
+}
+ 
+// The second method is Set(value string) error
+func (i *stringslice) Set(value string) error {
+    *i = append(*i, value)
+    return nil
+}
+ 
 func main() {
+	var container_excludes_file  string
+	var image_excludes_file      string
+	var conserving_deadline_secs int64
+	var c_excludes               stringslice
+	var i_excludes               stringslice
+
+
+	flag.StringVar(&container_excludes_file, "fc", "/etc/undertaker/container_excludes", "exclude file for containers")
+	flag.StringVar(&image_excludes_file,     "fi", "/etc/undertaker/image_excludes", "exclude file for images")
+	flag.Int64Var(&conserving_deadline_secs, "wait", int64(3600), "conserving deadline in seconds")
+
+	flag.Var(&c_excludes,"c","a single container exclude");
+	flag.Var(&i_excludes,"i","a single image exclude");
+
+ 	flag.Parse()
+
+	fmt.Println("c_excludes=",c_excludes);
+	fmt.Println("i_excludes=",i_excludes);
+
 	endpoint := "unix:///var/run/docker.sock"
 	client, err := docker.NewClient(endpoint)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	container_excludes, _ := loadExcludes("./container-excludes")
-	still_warm_secs       := int64(0) //3600;
-
+	container_excludes, _ := loadExcludes(container_excludes_file)
+	for _,ex := range c_excludes {
+		container_excludes = append(container_excludes,regexp.MustCompile(ex));
+	}
+	
+	image_excludes, _ := loadExcludes(image_excludes_file)
+	for _,ex := range i_excludes {
+		image_excludes = append(image_excludes,regexp.MustCompile(ex));
+	}
 
 	var inuse_ids []string
 	var containers_exited []docker.APIContainers
@@ -158,30 +214,27 @@ func main() {
 			// APIContainers.Image may hold either a name or an ID)
 			tmp, _ := client.InspectContainer(cont.ID)
 			inuse_ids = append(inuse_ids,tmp.Image);
-			fmt.Printf("image in use: %s (%s)\n",tmp.Image, cont.Image);
+			//fmt.Printf("image in use: %s (%s)\n",tmp.Image, cont.Image);
 		}
 	}
 	
-	containers_exited = filterContainers(containers_exited, container_excludes)
+	containers_exited = filterContainers(client,containers_exited, container_excludes,&inuse_ids)
 
 	var containers_to_kill []*docker.Container
 
 	for _, cont := range containers_exited {
-		// TODO: first test if any exclusion filter matches the container ID or container.name
-
 		container, _ := client.InspectContainer(cont.ID)
 
-		if (time.Now().Unix() - container.State.FinishedAt.Unix()) < still_warm_secs {
+		if (time.Now().Unix() - container.State.FinishedAt.Unix()) < conserving_deadline_secs {
 			inuse_ids = append(inuse_ids,container.Config.Image);
 		} else {
 			containers_to_kill = append(containers_to_kill,container);
 		}
 	}
 
-	images_all, _       := client.ListImages(docker.ListImagesOptions{All: false})
-	images_excludes, _  := loadExcludes("./image-excludes")
+	images_all, _ := client.ListImages(docker.ListImagesOptions{All: false})
 
-	images_to_kill := filterImages(images_all,images_excludes,inuse_ids);
+	images_to_kill := filterImages(images_all,image_excludes,inuse_ids);
 
 
 	for i, cont := range containers_to_kill {
