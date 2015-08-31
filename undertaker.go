@@ -13,13 +13,13 @@ import (
 )
 
 func filterContainers(containers []docker.APIContainers, patterns []*regexp.Regexp) []docker.APIContainers {
-	// apply filters against container.ID and container.Names[]
 	var res []docker.APIContainers
 
 	var match_found bool
 
 	for _, container := range containers {
 		match_found = false
+		// loop through pattens and check for match on ID or Names[]
 		for _, pattern := range patterns {
 			if len(pattern.FindString(container.ID)) > 0 {
 				match_found = true
@@ -32,6 +32,7 @@ func filterContainers(containers []docker.APIContainers, patterns []*regexp.Rege
 				}
 			}
 			if match_found {
+				break
 			}
 		}
 		if !match_found {
@@ -43,8 +44,45 @@ func filterContainers(containers []docker.APIContainers, patterns []*regexp.Rege
 }
 
 func filterImages(images []docker.APIImages, patterns []*regexp.Regexp, inuseids []string) []docker.APIImages {
-	// apply filters against image.ID and image.RepoTags
 	var res []docker.APIImages
+
+	var match_found bool
+
+	for _, image := range images {
+		match_found = false
+
+		// check if this image is in use
+		for _,inuse := range inuseids {
+			if image.ID == inuse {
+				match_found = true;
+				break;
+			}
+		}
+
+		if match_found {
+			break;
+		}
+
+		// loop over patterns and check ID and RepoTags[] for match
+		for _, pattern := range patterns {
+			if len(pattern.FindString(image.ID)) > 0 {
+				match_found = true
+				break
+			}
+			for _, name := range image.RepoTags {
+				if len(pattern.FindString(name)) > 0 {
+					match_found = true
+					break
+				}
+			}
+			if match_found {
+				break
+			}
+		}
+		if !match_found {
+			res = append(res, image)
+		}
+	}
 
 	return res
 }
@@ -102,65 +140,64 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	fmt.Println(client)
 
 	container_excludes, _ := loadExcludes("./container-excludes")
-	fmt.Println(container_excludes)
+	still_warm_secs       := int64(0) //3600;
 
-	filters := make(map[string][]string)
-	filters["status"] = []string{"exited"}
 
-	container_exited, _ := client.ListContainers(docker.ListContainersOptions{All: true, Filters: filters})
+	var inuse_ids []string
+	var containers_exited []docker.APIContainers
 
-	container_exited = filterContainers(container_exited, container_excludes)
+	containers_all, _ := client.ListContainers(docker.ListContainersOptions{All: true})
+	for _, cont := range containers_all {
+		//fmt.Printf("%v %v\n",cont.Names,cont.Status);
+		if strings.Index(cont.Status,"Exited") == 0 {
+			containers_exited = append(containers_exited,cont);
+		} else {
+			// we need to inspect the container for the real ID (field 
+			// APIContainers.Image may hold either a name or an ID)
+			tmp, _ := client.InspectContainer(cont.ID)
+			inuse_ids = append(inuse_ids,tmp.Image);
+			fmt.Printf("image in use: %s (%s)\n",tmp.Image, cont.Image);
+		}
+	}
+	
+	containers_exited = filterContainers(containers_exited, container_excludes)
 
-	for i, cont := range container_exited {
+	var containers_to_kill []*docker.Container
+
+	for _, cont := range containers_exited {
 		// TODO: first test if any exclusion filter matches the container ID or container.name
 
 		container, _ := client.InspectContainer(cont.ID)
-		fmt.Printf("ALL: container[%d] %v %v %v\n", i, container.ID, container.Name, container.State.FinishedAt)
-		fmt.Println(time.Now().Unix() - container.State.FinishedAt.Unix())
 
-		// check if time diff is long enough -> if not: at container.Config.Image to the INUSE list
-		// ELSE: add container structure to the take-under list
-		/*
-			b, err := json.Marshal(container)
-			if err != nil {
-				fmt.Println(err)
-			} else {
-				fmt.Println(string(b))
-			}
-		*/
+		if (time.Now().Unix() - container.State.FinishedAt.Unix()) < still_warm_secs {
+			inuse_ids = append(inuse_ids,container.Config.Image);
+		} else {
+			containers_to_kill = append(containers_to_kill,container);
+		}
 	}
 
-	//container_running,_ := client.ListContainers(docker.ListContainersOptions{All:false})
+	images_all, _       := client.ListImages(docker.ListImagesOptions{All: false})
+	images_excludes, _  := loadExcludes("./image-excludes")
 
-	//images_all, _ := client.ListImages(docker.ListImagesOptions{All: false})
+	images_to_kill := filterImages(images_all,images_excludes,inuse_ids);
 
-	//for i, container := range container_running {
-	//	fmt.Printf("RUN: container[%d] %v\n",i,container);
-	//}
 
-	//for i, img := range images_all {
-	//	fmt.Printf("image [%d] %v\n",i,img);
-	//}
-
-	//image_excludes := loadExcludes(IMAGE_EXCLUDES);
-
-	//imgs, _ := client.ListImages(docker.ListImagesOptions{All: false})
-	//for _, img := range imgs {
-
-	// TODO:
-	// (1) remove in use-images
-	// (2) filter out exlusions (either img.ID or img.RepoTags[]
-	/*
+	for i, cont := range containers_to_kill {
+		fmt.Printf("rm container [%2d]: %64s %v\n",i, cont.ID, cont.Name);
+	}
+	
+	for i, img := range images_to_kill {
+		fmt.Printf("rm image     [%2d]: %64s %v\n",i, img.ID, img.RepoTags);
+	}
+/*
 		b, err := json.Marshal(img)
 		if err != nil {
 			fmt.Println(err)
 		} else {
 			fmt.Println(string(b))
 		}
-	*/
-	//}
-
+*/
 }
+
