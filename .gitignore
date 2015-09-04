@@ -1,3 +1,5 @@
 bin/*
-third-party/pkg/*
+# for now exclude everything in third-party ... 
+# TODO: use dependency manager
+third-party/*
 undertaker
