@@ -2,7 +2,7 @@ package main
 
 import (
 	"bufio"
-	//"encoding/json"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"github.com/fsouza/go-dockerclient"
@@ -10,8 +10,126 @@ import (
 	"os"
 	"regexp"
 	"strings"
-	"time"
+//	"time"
 )
+
+// MultiStringOption is a commandline string option which can be specified 
+// multiple times and will be parsed by flag.Var() / flag.Parse() into an
+// array.
+type MultiStringOption []string
+
+// implementation of flag.Value interface (part 1)
+func (i *MultiStringOption) String() string {
+    return fmt.Sprintf("%s", *i);
+}
+
+// implementation of flag.Value interface (part 2)
+func (i *MultiStringOption) Set(value string) error {
+	*i = append(*i, value)
+	return nil
+}
+
+type RegexpHolder struct {
+	re *regexp.Regexp
+	RegExp string
+}
+
+
+type UndertakerData struct {
+	ContainerExc     *[]RegexpHolder
+	ContainerInc     *[]RegexpHolder
+	ImageExc         *[]RegexpHolder
+	ImageInc         *[]RegexpHolder
+	client            *docker.Client
+	ContainersAll     []docker.APIContainers
+	ContainersExited  []docker.APIContainers;
+	InuseImageIds     []string
+}
+
+func NewUndertakerData() *UndertakerData {
+	return &UndertakerData{
+		new([]RegexpHolder),
+		new([]RegexpHolder),
+		new([]RegexpHolder),
+		new([]RegexpHolder),
+		nil,
+		make([]docker.APIContainers,0),
+		make([]docker.APIContainers,0),
+		make([]string,0)};
+}
+
+func (u UndertakerData) String() string {
+	b, err := json.MarshalIndent(u,"","  ")
+	if err != nil {
+		return fmt.Sprintln(err)
+	} 
+	
+	return fmt.Sprintln(string(b))
+}
+
+func generateRegexp(input *MultiStringOption) (*[]RegexpHolder) {
+	var resptr = new([]RegexpHolder);
+	for _,text := range *input {
+		if pattern, err := regexp.Compile(text); err != nil {
+			log.Fatal("invalid pattern: [", text, " ] - ", err)
+		} else {
+			*resptr = append(*resptr, RegexpHolder{pattern,text})
+		}
+	}
+	return resptr;
+}
+
+func containsString(slice []string, val string) bool {
+	for _, a := range slice {
+		if a == val {
+			return true
+		}
+	}
+	return false
+}
+
+// loads exclude file removing comments and empty lines
+func loadFile(filename string) (*MultiStringOption, error) {
+	file, err := os.Open(filename)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	var res MultiStringOption;
+
+	re_comment_prefix := regexp.MustCompile("^#.*")
+	re_comment_postfix := regexp.MustCompile("#.*$")
+
+	scanner := bufio.NewScanner(file)
+	text := ""
+	for scanner.Scan() {
+		// remove leading and trailing spaces
+		text = strings.TrimSpace(scanner.Text())
+
+		// remove lines starting with comment char (lines starting with #)
+		if text = re_comment_prefix.ReplaceAllString(text, ""); len(text) == 0 {
+			continue
+		}
+		// remove postfix comments (comments at the end of a line)
+		if text = re_comment_postfix.ReplaceAllString(text, ""); len(text) == 0 {
+			continue
+		}
+		// trim spaces again
+		if text = strings.TrimSpace(text); len(text) == 0 {
+			continue
+		}
+
+		res.Set(text)
+	}
+
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+	return &res, nil
+}
+
+
 
 func filterContainers(client *docker.Client, containers []docker.APIContainers, patterns []*regexp.Regexp,inuse_ids *[]string) []docker.APIContainers {
 	var res []docker.APIContainers
@@ -101,122 +219,105 @@ func filterImages(images []docker.APIImages, patterns []*regexp.Regexp, inuseids
 	return res
 }
 
-// loads exclude file removing comments and empty lines
-func loadExcludes(filename string) ([]*regexp.Regexp, error) {
-	file, err := os.Open(filename)
-	if err != nil {
-		return nil, err
-	}
-	defer file.Close()
-
-	res := make([]*regexp.Regexp, 0)
-	var pattern *regexp.Regexp
-
-	re_comment_prefix := regexp.MustCompile("^#.*")
-	re_comment_postfix := regexp.MustCompile("#.*$")
-
-	scanner := bufio.NewScanner(file)
-	text := ""
-	for scanner.Scan() {
-		// remove leading and trailing spaces
-		text = strings.TrimSpace(scanner.Text())
-
-		// remove lines starting with comment char (lines starting with #)
-		if text = re_comment_prefix.ReplaceAllString(text, ""); len(text) == 0 {
-			continue
-		}
-		// remove postfix comments (comments at the end of a line)
-		if text = re_comment_postfix.ReplaceAllString(text, ""); len(text) == 0 {
-			continue
-		}
-		// trim spaces again
-		if text = strings.TrimSpace(text); len(text) == 0 {
-			continue
-		}
-
-		if pattern, err = regexp.Compile(text); err != nil {
-			log.Println("invalid exclusion pattern: [", text, " ] - ", err)
-			continue
-		}
-
-		res = append(res, pattern)
-	}
-
-	if err := scanner.Err(); err != nil {
-		return nil, err
-	}
-	return res, nil
-}
-
-
-// Define a type named "intslice" as a slice of ints
-type stringslice []string
- 
-// Now, for our new type, implement the two methods of
-// the flag.Value interface...
-// The first method is String() string
-func (i *stringslice) String() string {
-    return fmt.Sprintf("%s", *i);
-}
- 
-// The second method is Set(value string) error
-func (i *stringslice) Set(value string) error {
-    *i = append(*i, value)
-    return nil
-}
- 
-func main() {
+func processCommandLine() (*UndertakerData,error) {
 	var container_excludes_file  string
 	var image_excludes_file      string
 	var conserving_deadline_secs int64
-	var c_excludes               stringslice
-	var i_excludes               stringslice
+	var c_excludes               MultiStringOption
+	var i_excludes               MultiStringOption
+	var c_includes               MultiStringOption
+	var i_includes               MultiStringOption
 
-
-	flag.StringVar(&container_excludes_file, "fc", "/etc/undertaker/container_excludes", "exclude file for containers")
-	flag.StringVar(&image_excludes_file,     "fi", "/etc/undertaker/image_excludes", "exclude file for images")
+	flag.StringVar(&container_excludes_file, "filecexc", "", "read container excludes from file")
+	flag.StringVar(&image_excludes_file,     "fileiexc", "", "read image excludes from file")
 	flag.Int64Var(&conserving_deadline_secs, "wait", int64(3600), "conserving deadline in seconds")
 
-	flag.Var(&c_excludes,"c","a single container exclude");
-	flag.Var(&i_excludes,"i","a single image exclude");
+	flag.Var(&c_excludes,"cexc","a single container exclude");
+	flag.Var(&i_excludes,"iexc","a single image exclude");
+	flag.Var(&c_includes,"cinc","a single container include");
+	flag.Var(&i_includes,"iinc","a single image incclude");
 
- 	flag.Parse()
+	flag.Parse()
 
-	fmt.Println("c_excludes=",c_excludes);
-	fmt.Println("i_excludes=",i_excludes);
+	var resptr = NewUndertakerData();
+
+	if len(container_excludes_file) > 0 {
+		ptr,err := loadFile(container_excludes_file);
+		if err != nil {
+			return nil,err
+		}
+
+		resptr.ContainerExc = generateRegexp(ptr);
+	}
+
+	if len(image_excludes_file) > 0 {
+		ptr,err := loadFile(image_excludes_file);
+		if err != nil {
+			return nil,err
+		}
+
+		resptr.ImageExc = generateRegexp(ptr);
+	}
+
+	if len(c_excludes) > 0 {
+		*resptr.ContainerExc = append(*resptr.ContainerExc,*generateRegexp(&c_excludes)...)
+	}
+
+	if len(i_excludes) > 0 {
+		*resptr.ImageExc = append(*resptr.ImageExc,*generateRegexp(&i_excludes)...)
+	}
+
+	if len(c_includes) > 0 {
+		*resptr.ContainerInc = append(*resptr.ContainerInc,*generateRegexp(&c_includes)...)
+	}
+
+	if len(i_includes) > 0 {
+		*resptr.ImageInc = append(*resptr.ImageInc,*generateRegexp(&i_includes)...)
+	}
+
+	return resptr,nil
+}
+
+
+func main() {
+	var dataPtr *UndertakerData
+	var err     error
+
+	dataPtr,err = processCommandLine();
+	if err != nil {
+		log.Fatal(err);
+	}
 
 	endpoint := "unix:///var/run/docker.sock"
-	client, err := docker.NewClient(endpoint)
+	dataPtr.client, err = docker.NewClient(endpoint)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	container_excludes, _ := loadExcludes(container_excludes_file)
-	for _,ex := range c_excludes {
-		container_excludes = append(container_excludes,regexp.MustCompile(ex));
+	dataPtr.ContainersAll, err = dataPtr.client.ListContainers(docker.ListContainersOptions{All: true})
+	if err != nil {
+		log.Fatal(err);
 	}
-	
-	image_excludes, _ := loadExcludes(image_excludes_file)
-	for _,ex := range i_excludes {
-		image_excludes = append(image_excludes,regexp.MustCompile(ex));
-	}
-
-	var inuse_ids []string
-	var containers_exited []docker.APIContainers
-
-	containers_all, _ := client.ListContainers(docker.ListContainersOptions{All: true})
-	for _, cont := range containers_all {
+	for _, cont := range dataPtr.ContainersAll {
 		//fmt.Printf("%v %v\n",cont.Names,cont.Status);
 		if strings.Index(cont.Status,"Exited") == 0 {
-			containers_exited = append(containers_exited,cont);
+			dataPtr.ContainersExited = append(dataPtr.ContainersExited,cont);
 		} else {
 			// we need to inspect the container for the real ID (field 
 			// APIContainers.Image may hold either a name or an ID)
-			tmp, _ := client.InspectContainer(cont.ID)
-			inuse_ids = append(inuse_ids,tmp.Image);
-			//fmt.Printf("image in use: %s (%s)\n",tmp.Image, cont.Image);
+			tmp, err := dataPtr.client.InspectContainer(cont.ID)
+			if err != nil {
+				log.Fatal(err)
+			}
+			if !containsString(dataPtr.InuseImageIds,tmp.Image)  {
+				dataPtr.InuseImageIds = append(dataPtr.InuseImageIds,tmp.Image);
+			}
 		}
 	}
+
+	fmt.Println(dataPtr);
+
+/*
 	
 	containers_exited = filterContainers(client,containers_exited, container_excludes,&inuse_ids)
 
@@ -244,13 +345,6 @@ func main() {
 	for i, img := range images_to_kill {
 		fmt.Printf("rm image     [%2d]: %64s %v\n",i, img.ID, img.RepoTags);
 	}
-/*
-		b, err := json.Marshal(img)
-		if err != nil {
-			fmt.Println(err)
-		} else {
-			fmt.Println(string(b))
-		}
 */
 }
 
