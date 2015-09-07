@@ -9,10 +9,10 @@ info() {
 
 DOCKER_IMAGE="daolabs/undertaker:latest"
 info "executing go get ..."
-./tools/go-builder get
+./tools/go-builder go get
 
 info "building statically linked binary [undertaker] ..."
-CGO_ENABLED=0 ./tools/go-builder build -a --ldflags='-s'
+CGO_ENABLED=0 ./tools/go-builder go build -a -ldflags='-s'
 
 info "building [$DOCKER_IMAGE] ..."
 docker build -t "$DOCKER_IMAGE" .
