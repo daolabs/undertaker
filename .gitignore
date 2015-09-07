@@ -1,5 +1,5 @@
 bin/*
 # for now exclude everything in third-party ... 
 # TODO: use dependency manager
-third-party/*
+vendor/*
 undertaker
